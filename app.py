@@ -1,4 +1,5 @@
 import os
+import time
 import tempfile
 import faiss
 import numpy as np
@@ -20,13 +21,53 @@ load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    st.error("Gemini API key not found. Please check your .env file.")
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        api_key = None
+
+if not api_key:
+    st.error("Gemini API key not found. Check your .env or Streamlit Secrets.")
     st.stop()
 
 client = genai.Client(api_key=api_key)
 
 EMBEDDING_MODEL = "gemini-embedding-2"
-GENERATION_MODEL = "gemini-3.8-flash"
+GENERATION_MODEL = "gemini-3.5-flash-lite"
+
+
+# ---------------------------------
+# Gemini Answer Generation with Retry
+# ---------------------------------
+
+def generate_answer(prompt):
+
+    for attempt in range(3):
+
+        try:
+            response = client.models.generate_content(
+                model=GENERATION_MODEL,
+                contents=prompt
+            )
+
+            return response
+
+        except Exception as e:
+
+            error_message = str(e)
+
+            if "503" in error_message and attempt < 2:
+
+                wait_time = 2 ** (attempt + 1)
+
+                st.warning(
+                    f"Gemini is temporarily busy. Retrying in {wait_time} seconds..."
+                )
+
+                time.sleep(wait_time)
+
+            else:
+                raise e
 
 
 # ---------------------------------
@@ -78,18 +119,20 @@ uploaded_files = st.file_uploader(
 
 
 # ---------------------------------
-# Process Uploaded Documents
+# Process Research Papers
 # ---------------------------------
 
 if st.button("Process Research Papers"):
 
     if not uploaded_files:
+
         st.warning("Please upload at least one PDF.")
 
     else:
 
         all_chunks = []
         chunk_sources = []
+        processed_files = []
 
         with st.spinner("Processing research papers..."):
 
@@ -101,7 +144,6 @@ if st.button("Process Research Papers"):
 
                 try:
 
-                    # Save PDF temporarily
                     with tempfile.NamedTemporaryFile(
                         delete=False,
                         suffix=".pdf"
@@ -114,6 +156,7 @@ if st.button("Process Research Papers"):
                     text = extract_text_from_pdf(temp_path)
 
                     if not text.strip():
+
                         st.warning(
                             f"No readable text found in {uploaded_file.name}"
                         )
@@ -123,105 +166,96 @@ if st.button("Process Research Papers"):
                     chunks = create_chunks(text)
 
                     if not chunks:
+
                         st.warning(
                             f"No chunks generated for {uploaded_file.name}"
                         )
                         continue
 
-                    # Combine chunks
                     all_chunks.extend(chunks)
 
-                    # Store source filenames
                     chunk_sources.extend(
                         [uploaded_file.name] * len(chunks)
                     )
 
+                    processed_files.append(uploaded_file.name)
+
                     st.success(
-                        f"{uploaded_file.name}: "
-                        f"{len(chunks)} chunks created."
+                        f"{uploaded_file.name}: {len(chunks)} chunks created."
                     )
 
                 except Exception as e:
+
                     st.error(
                         f"Error processing {uploaded_file.name}: {e}"
                     )
 
                 finally:
+
                     if temp_path and os.path.exists(temp_path):
                         os.remove(temp_path)
 
-            # ---------------------------------
-            # Generate Embeddings
-            # ---------------------------------
+        # ---------------------------------
+        # Generate Embeddings
+        # ---------------------------------
 
-            if all_chunks:
+        if all_chunks:
 
-                try:
+            try:
 
-                    with st.spinner("Generating embeddings..."):
+                with st.spinner("Generating embeddings..."):
 
-                        contents = [
-                            types.Content(
-                                parts=[
-                                    types.Part.from_text(text=chunk)
-                                ]
-                            )
-                            for chunk in all_chunks
-                        ]
-
-                        result = client.models.embed_content(
-                            model=EMBEDDING_MODEL,
-                            contents=contents
+                    contents = [
+                        types.Content(
+                            parts=[
+                                types.Part.from_text(text=chunk)
+                            ]
                         )
-
-                        embeddings = np.array(
-                            [e.values for e in result.embeddings],
-                            dtype="float32"
-                        )
-
-                    # ---------------------------------
-                    # Create FAISS Index
-                    # ---------------------------------
-
-                    dimension = embeddings.shape[1]
-
-                    index = faiss.IndexFlatL2(dimension)
-
-                    index.add(embeddings)
-
-                    # Save in session state
-                    st.session_state.index = index
-                    st.session_state.chunks = all_chunks
-                    st.session_state.chunk_sources = chunk_sources
-
-                    st.session_state.processed_files = [
-                        f.name for f in uploaded_files
+                        for chunk in all_chunks
                     ]
 
-                    st.success("All research papers processed successfully!")
-
-                    st.info(
-                        f"Total papers: {len(st.session_state.processed_files)}"
+                    result = client.models.embed_content(
+                        model=EMBEDDING_MODEL,
+                        contents=contents
                     )
 
-                    st.info(
-                        f"Total chunks: {len(all_chunks)}"
+                    embeddings = np.array(
+                        [e.values for e in result.embeddings],
+                        dtype="float32"
                     )
 
-                    st.info(
-                        f"Total vectors stored: {index.ntotal}"
-                    )
+                # ---------------------------------
+                # FAISS Vector Store
+                # ---------------------------------
 
-                except Exception as e:
+                dimension = embeddings.shape[1]
 
-                    st.error(f"Embedding or FAISS error: {e}")
+                index = faiss.IndexFlatL2(dimension)
 
-            else:
-                st.error("No valid text chunks were generated.")
+                index.add(embeddings)
+
+                st.session_state.index = index
+                st.session_state.chunks = all_chunks
+                st.session_state.chunk_sources = chunk_sources
+                st.session_state.processed_files = processed_files
+
+                st.success("Research papers processed successfully!")
+
+                st.info(f"Total papers: {len(processed_files)}")
+                st.info(f"Total chunks: {len(all_chunks)}")
+                st.info(f"Total vectors: {index.ntotal}")
+
+            except Exception as e:
+
+                st.error(f"Embedding or FAISS error: {e}")
+
+        else:
+
+            st.error("No valid text chunks were generated.")
 
 
 # ---------------------------------
-# Display Processed Documents
+# Display Processed Papers
 # ---------------------------------
 
 if st.session_state.processed_files:
@@ -229,6 +263,7 @@ if st.session_state.processed_files:
     st.header("2. Uploaded Research Papers")
 
     for filename in st.session_state.processed_files:
+
         st.write(f"📄 {filename}")
 
 
@@ -256,10 +291,7 @@ if st.session_state.index is not None:
 
                 with st.spinner("Searching papers and generating answer..."):
 
-                    # ---------------------------------
-                    # Generate Question Embedding
-                    # ---------------------------------
-
+                    # Question Embedding
                     query_result = client.models.embed_content(
                         model=EMBEDDING_MODEL,
                         contents=question
@@ -270,10 +302,7 @@ if st.session_state.index is not None:
                         dtype="float32"
                     )
 
-                    # ---------------------------------
-                    # FAISS Similarity Search
-                    # ---------------------------------
-
+                    # FAISS Search
                     k = min(3, st.session_state.index.ntotal)
 
                     distances, indices = st.session_state.index.search(
@@ -297,55 +326,40 @@ if st.session_state.index is not None:
                             st.session_state.chunk_sources[idx]
                         )
 
-                    # ---------------------------------
                     # Prepare Context
-                    # ---------------------------------
-
-                    context = "\n\n".join(
-                        retrieved_chunks
-                    )
+                    context = "\n\n".join(retrieved_chunks)
 
                     prompt = f"""
-                    You are a Research Paper Assistant.
+You are a Research Paper Assistant.
 
-                    Answer the user's question using ONLY
-                    the information provided in the context.
+Answer the user's question using ONLY the information
+provided in the context.
 
-                    If the answer is not available in the
-                    context, clearly state that the uploaded
-                    research papers do not contain sufficient
-                    information to answer the question.
+If the answer is not available in the context,
+clearly state that the uploaded research papers
+do not contain sufficient information.
 
-                    Context:
-                    {context}
+Context:
+{context}
 
-                    Question:
-                    {question}
+Question:
+{question}
 
-                    Provide a clear and accurate answer.
-                    """
+Provide a clear and accurate answer.
+"""
 
-                    # ---------------------------------
-                    # Gemini Answer Generation
-                    # ---------------------------------
+                    # Gemini Generation with Retry
+                    response = generate_answer(prompt)
 
-                    response = client.models.generate_content(
-                        model=GENERATION_MODEL,
-                        contents=prompt
-                    )
-
-                # ---------------------------------
                 # Display Answer
-                # ---------------------------------
-
                 st.subheader("Answer")
 
-                st.write(response.text)
+                if response.text:
+                    st.write(response.text)
+                else:
+                    st.warning("Gemini returned an empty response.")
 
-                # ---------------------------------
                 # Display Sources
-                # ---------------------------------
-
                 st.subheader("Source Research Papers")
 
                 unique_sources = list(
@@ -353,6 +367,7 @@ if st.session_state.index is not None:
                 )
 
                 for source in unique_sources:
+
                     st.write(f"📄 {source}")
 
             except Exception as e:
